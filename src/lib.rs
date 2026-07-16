@@ -1,12 +1,12 @@
 use chrono::Utc;
-use pyo3::exceptions::{PyKeyError, PySystemError, PyValueError};
+use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedStr;
 use pyo3::types::PyAny;
-use pythonize::{depythonize, pythonize};
 use std::collections::HashMap;
 
-/// Default size cap in bytes if the caller does not provide one.
-const DEFAULT_MAX_MEMORY_LIMIT: u64 = 1_000_000; // 1 MB
+/// Default capacity (maximum number of items) if the caller does not provide one.
+const DEFAULT_CAPACITY: usize = 10_000;
 
 // ---------------------------------------------------------------------------
 // Internal doubly-linked list node — not exposed to Python.
@@ -14,12 +14,11 @@ const DEFAULT_MAX_MEMORY_LIMIT: u64 = 1_000_000; // 1 MB
 
 #[pyclass]
 struct CacheNode {
-    key: String,
-    data: Vec<u8>,
+    key: PyBackedStr,
+    data: Py<PyAny>,
     last_used: i64,
     left: Option<Py<CacheNode>>,
     right: Option<Py<CacheNode>>,
-    size: u64,
 }
 
 // CacheNode must be a #[pyclass] so values can be stored as Py<CacheNode>.
@@ -28,28 +27,25 @@ struct CacheNode {
 #[pymethods]
 impl CacheNode {}
 
-
 // ---------------------------------------------------------------------------
 // Public cache type
 // ---------------------------------------------------------------------------
 
-/// An in-memory, size-capped LRU cache backed by a doubly-linked list and a
-/// hash map.  Serialises Python objects to JSON bytes internally.
+/// An in-memory, item-capped LRU cache backed by a doubly-linked list and a
+/// hash map. Stores raw Python objects.
 ///
 /// Parameters
 /// ----------
-/// limit : int
-///     Maximum number of bytes the cache may hold (measured as the length of
-///     the JSON-serialised value).  Defaults to 1 MB.
+/// capacity : int
+///     Maximum number of items the cache may hold. Defaults to 10,000.
 #[pyclass(module = "ric_lib")]
 pub struct Cache {
-    /// Maximum total payload size in bytes.
+    /// Maximum number of items in the cache.
     #[pyo3(get)]
-    pub limit: u64,
-    size: u64,
+    pub capacity: usize,
     head: Option<Py<CacheNode>>,
     tail: Option<Py<CacheNode>>,
-    table: HashMap<String, Option<Py<CacheNode>>>,
+    table: HashMap<PyBackedStr, Option<Py<CacheNode>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -59,11 +55,10 @@ pub struct Cache {
 #[pymethods]
 impl Cache {
     #[new]
-    #[pyo3(signature = (limit))]
-    fn new(limit: u64) -> Self {
+    #[pyo3(signature = (capacity))]
+    fn new(capacity: usize) -> Self {
         Self {
-            limit,
-            size: 0,
+            capacity,
             head: None,
             tail: None,
             table: HashMap::new(),
@@ -71,37 +66,36 @@ impl Cache {
     }
 
     /// Insert or overwrite a key.  Evicts the least-recently-used entry when
-    /// the cache would exceed its limit.
-    ///
-    /// Raises
-    /// ------
-    /// ValueError
-    ///     If the serialised value is larger than the cache limit itself.
+    /// the cache would exceed its capacity.
     #[pyo3(signature = (key, value))]
-    fn insert(&mut self, py: Python<'_>, key: String, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let data = self.encode(value)?;
+    fn insert(
+        &mut self,
+        py: Python<'_>,
+        key: PyBackedStr,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
         let last_used = Self::now_ms();
-        let curr_data_size = data.len() as u64;
 
-        if curr_data_size > self.limit {
-            return Err(PyValueError::new_err(format!(
-                "Value for key '{}' ({} bytes) exceeds the cache limit ({} bytes)",
-                key, curr_data_size, self.limit
-            )));
+        // Evict until we have space for 1 more item.
+        // If we are replacing an existing key, the total size doesn't increase,
+        // but we handle eviction first if it's a new key.
+        let is_new_key = !self.table.contains_key(&key);
+        if is_new_key {
+            while self.table.len() >= self.capacity {
+                self.evict_lru(py);
+            }
         }
 
-        while self.size + curr_data_size > self.limit {
-            self.evict_lru(py);
-        }
-
-        let new_node = Py::new(py, CacheNode {
-            key: key.clone(),
-            data,
-            last_used,
-            left: None,
-            right: None,
-            size: curr_data_size,
-        })?;
+        let new_node = Py::new(
+            py,
+            CacheNode {
+                key: key.clone_ref(py),
+                data: value.clone().unbind(),
+                last_used,
+                left: None,
+                right: None,
+            },
+        )?;
 
         // Prepend to head.
         if let Some(ref curr_head) = self.head {
@@ -111,13 +105,10 @@ impl Cache {
             self.tail = Some(new_node.clone_ref(py));
         }
         self.head = Some(new_node.clone_ref(py));
-        self.size += curr_data_size;
 
         // Overwrite table entry; remove old node from list if it existed.
         if let Some(Some(old_node)) = self.table.insert(key, Some(new_node.clone_ref(py))) {
             if !old_node.is(&new_node) {
-                let old_size = old_node.borrow(py).size;
-                self.size = self.size.saturating_sub(old_size);
                 self.unlink(py, old_node);
             }
         }
@@ -133,7 +124,7 @@ impl Cache {
     /// KeyError
     ///     If the key is not present in the cache.
     #[pyo3(signature = (key))]
-    fn get<'py>(&mut self, py: Python<'py>, key: String) -> PyResult<Bound<'py, PyAny>> {
+    fn get<'py>(&mut self, py: Python<'py>, key: PyBackedStr) -> PyResult<Py<PyAny>> {
         // Drop the table borrow before calling &mut self methods.
         let (node, node_data) = {
             let entry = self
@@ -142,9 +133,9 @@ impl Cache {
                 .ok_or_else(|| PyKeyError::new_err(format!("Key '{}' not found", key)))?;
 
             match entry {
-                Some(n) => (n.clone_ref(py), n.borrow(py).data.clone()),
+                Some(n) => (n.clone_ref(py), n.borrow(py).data.clone_ref(py)),
                 None => {
-                    return Err(PyValueError::new_err(format!(
+                    return Err(PyKeyError::new_err(format!(
                         "Value associated with key '{}' is corrupted",
                         key
                     )));
@@ -154,16 +145,14 @@ impl Cache {
 
         node.borrow_mut(py).last_used = Self::now_ms();
         self.move_to_head(py, node);
-        self.decode(py, node_data)
+        Ok(node_data)
     }
 
     /// Remove a key from the cache.  Returns ``True`` if the key existed,
     /// ``False`` otherwise.
     #[pyo3(signature = (key))]
-    fn remove(&mut self, py: Python<'_>, key: String) -> bool {
+    fn remove(&mut self, py: Python<'_>, key: PyBackedStr) -> bool {
         if let Some(Some(node)) = self.table.remove(&key) {
-            let node_size = node.borrow(py).size;
-            self.size = self.size.saturating_sub(node_size);
             self.unlink(py, node);
             true
         } else {
@@ -173,14 +162,8 @@ impl Cache {
 
     /// Returns ``True`` if the key exists in the cache (without updating LRU order).
     #[pyo3(signature = (key))]
-    fn contains(&self, key: String) -> bool {
+    fn contains(&self, key: PyBackedStr) -> bool {
         self.table.contains_key(&key)
-    }
-
-    /// Current total byte usage.
-    #[pyo3(signature = ())]
-    fn size(&self) -> u64 {
-        self.size
     }
 
     /// Number of entries currently in the cache.
@@ -205,9 +188,8 @@ impl Cache {
 
     fn __repr__(&self) -> String {
         format!(
-            "Cache(limit={}, size={}, entries={})",
-            self.limit,
-            self.size,
+            "Cache(capacity={}, entries={})",
+            self.capacity,
             self.table.len()
         )
     }
@@ -216,7 +198,7 @@ impl Cache {
         self.table.len()
     }
 
-    fn __contains__(&self, key: String) -> bool {
+    fn __contains__(&self, key: PyBackedStr) -> bool {
         self.contains(key)
     }
 }
@@ -230,24 +212,8 @@ impl Cache {
         Utc::now().timestamp_millis()
     }
 
-    fn encode(&self, val: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-        let json_val: serde_json::Value = depythonize(val).map_err(|e| {
-            PySystemError::new_err(format!("failed to serialise Python object: {e}"))
-        })?;
-        serde_json::to_vec(&json_val)
-            .map_err(|e| PySystemError::new_err(format!("JSON serialisation failed: {e}")))
-    }
-
-    fn decode<'py>(&self, py: Python<'py>, val: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
-        let json_val: serde_json::Value = serde_json::from_slice(&val)
-            .map_err(|e| PySystemError::new_err(format!("JSON deserialisation failed: {e}")))?;
-        pythonize(py, &json_val).map_err(|e| {
-            PySystemError::new_err(format!("failed to convert value to Python object: {e}"))
-        })
-    }
-
-    /// Unlink `node` from the doubly-linked list.  Does not touch the table or
-    /// `self.size`.  Severs the node's own pointers to break `Py<T>` cycles.
+    /// Unlink `node` from the doubly-linked list. Does not touch the table.
+    /// Severs the node's own pointers to break `Py<T>` cycles.
     fn unlink(&mut self, py: Python<'_>, node: Py<CacheNode>) {
         let left = node.borrow(py).left.as_ref().map(|n| n.clone_ref(py));
         let right = node.borrow(py).right.as_ref().map(|n| n.clone_ref(py));
@@ -271,10 +237,8 @@ impl Cache {
             Some(ref t) => t.clone_ref(py),
             None => return,
         };
-        let key = tail.borrow(py).key.clone();
-        let size = tail.borrow(py).size;
+        let key = tail.borrow(py).key.clone_ref(py);
         self.table.remove(&key);
-        self.size = self.size.saturating_sub(size);
         self.unlink(py, tail);
     }
 
@@ -314,16 +278,16 @@ impl Cache {
 // Module entry point
 // ---------------------------------------------------------------------------
 
-/// Instantiate a size-capped LRU cache.
+/// Instantiate an item-capped LRU cache.
 ///
 /// Parameters
 /// ----------
-/// limit : int, optional
-///     Maximum total payload bytes.  Defaults to 1 048 576 (1 MB).
+/// capacity : int, optional
+///     Maximum number of items. Defaults to 10,000.
 #[pyfunction]
-#[pyo3(signature = (limit = None))]
-fn init_cache(limit: Option<u64>) -> Cache {
-    Cache::new(limit.unwrap_or(DEFAULT_MAX_MEMORY_LIMIT))
+#[pyo3(signature = (capacity = None))]
+fn init_cache(capacity: Option<usize>) -> Cache {
+    Cache::new(capacity.unwrap_or(DEFAULT_CAPACITY))
 }
 
 #[pymodule]

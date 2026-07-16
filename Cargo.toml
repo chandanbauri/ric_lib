@@ -1,6 +1,6 @@
 [package]
 name = "ric_lib"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "A fast, size-capped in-memory LRU cache exposed to Python via PyO3"
 authors = ["Chandan Bauri"]
@@ -16,5 +16,3 @@ crate-type = ["cdylib"]
 [dependencies]
 chrono = "0.4.45"
 pyo3 = "0.29.0"
-pythonize = "0.29.0"
-serde_json = "1"

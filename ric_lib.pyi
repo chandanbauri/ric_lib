@@ -1,39 +1,33 @@
-"""Type stubs for ric_lib — a size-capped LRU cache written in Rust."""
+"""Type stubs for ric_lib — an item-capped LRU cache written in Rust."""
 
 from typing import Any, Optional
 
-def init_cache(limit: Optional[int] = None) -> Cache:
-    """Create a new size-capped LRU cache.
+def init_cache(capacity: Optional[int] = None) -> Cache:
+    """Create a new item-capped LRU cache.
 
     Parameters
     ----------
-    limit:
-        Maximum total serialised payload in bytes.
-        Defaults to 1 048 576 (1 MB).
+    capacity:
+        Maximum number of items the cache can hold.
+        Defaults to 10,000.
     """
     ...
 
 class Cache:
-    """In-memory, size-capped LRU cache.
+    """In-memory, item-capped LRU cache.
 
-    Values must be JSON-serialisable Python objects (dicts, lists, str, int,
-    float, bool, None).  The cache serialises values to JSON bytes internally
-    and evicts the least-recently-used entry whenever a new insertion would
-    exceed the byte limit.
+    Values can be any Python object. The cache stores raw Python references
+    internally and evicts the least-recently-used entry whenever a new
+    insertion would exceed the item capacity.
     """
 
-    limit: int
-    """Maximum total payload size in bytes (read-only)."""
+    capacity: int
+    """Maximum number of items the cache can hold (read-only)."""
 
     def insert(self, key: str, value: Any) -> None:
         """Insert or overwrite *key* with *value*.
 
-        Evicts LRU entries until there is enough room.
-
-        Raises
-        ------
-        ValueError
-            If the serialised *value* alone exceeds ``self.limit``.
+        Evicts LRU entries if the capacity is exceeded.
         """
         ...
 
@@ -59,10 +53,6 @@ class Cache:
 
     def contains(self, key: str) -> bool:
         """Return ``True`` if *key* is in the cache (does not update LRU order)."""
-        ...
-
-    def size(self) -> int:
-        """Current total payload size in bytes."""
         ...
 
     def len(self) -> int:
